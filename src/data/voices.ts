@@ -16,7 +16,8 @@ export interface Voice {
   description: string;
 }
 
-// From https://huggingface.co/gradium/phonon-voices/blob/main/voices.jsonl
+// Metadata from https://huggingface.co/gradium/phonon-voices/blob/main/voices.jsonl;
+// the voice files are loaded from the model repo.
 export const VOICES: Array<Voice> = [
   {
     id: "NbpkqMVS3CJeq2j8",

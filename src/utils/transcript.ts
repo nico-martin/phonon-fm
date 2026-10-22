@@ -17,7 +17,7 @@ export interface Transcript {
   sentences: Array<Sentence>;
 }
 
-// Phonon handles at most 50 tokens per call; this many words stays below that.
+// Short segments keep voice changes and transcript highlighting responsive.
 const MAX_WORDS = 28;
 
 const SPEAKER_LINE = /^\*\*([^*]+?):\*\*\s*(.*)$/s;

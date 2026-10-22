@@ -1,7 +1,5 @@
-import type { RawAudio } from "@huggingface/transformers";
-
 import type { Sentence } from "../utils/transcript";
-import { type PhononTTS, SAMPLE_RATE, loadVoice } from "./phonon";
+import { type PhononTTS, SAMPLE_RATE, loadVoice, streamSpeech } from "./phonon";
 
 export type PlayerStatus = "idle" | "playing" | "paused" | "ended";
 
@@ -36,9 +34,6 @@ const SCHEDULE_AHEAD = 0.3;
 const GENERATE_AHEAD = 5;
 const TURN_GAP = 0.3;
 const TICK_MS = 100;
-
-// Thrown from the frame callback to abort a sentence that is no longer wanted.
-const CANCELLED = Symbol("cancelled");
 
 const INITIAL_STATE: PlayerState = {
   status: "idle",
@@ -117,7 +112,7 @@ export default class PodcastPlayer {
   // next sentence is generated with the new voice.
   setVoice = (speaker: string, voiceId: string) => {
     this.update({ voices: { ...this.state.voices, [speaker]: voiceId } });
-    void loadVoice(voiceId).catch(console.error);
+    void loadVoice(this.tts, voiceId).catch(console.error);
     const index = this.queue.findIndex(
       (segment) =>
         segment.sentence.speaker === speaker && segment.scheduled === 0
@@ -207,17 +202,15 @@ export default class PodcastPlayer {
         this.update({ generatingSentence: sentence.index });
 
         const start = performance.now();
-        try {
-          await this.tts(sentence.text, {
-            speaker_embeddings: await loadVoice(segment.voiceId),
-            callback_function: (chunk: RawAudio) => {
-              if (segment.cancelled) throw CANCELLED;
-              segment.chunks.push(chunk.audio as Float32Array); // Phonon is mono
-              this.schedule();
-            },
-          });
-        } catch (error) {
-          if (error !== CANCELLED) throw error;
+        for await (const frame of streamSpeech(
+          this.tts,
+          sentence.text,
+          segment.voiceId
+        )) {
+          // Leaving the loop stops generation of a sentence no longer wanted.
+          if (segment.cancelled) break;
+          segment.chunks.push(frame);
+          this.schedule();
         }
         segment.done = true;
         if (segment.cancelled) continue;

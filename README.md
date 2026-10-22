@@ -8,9 +8,9 @@ Phonon FM reads podcast transcripts aloud with [Phonon 31M](https://huggingface.
 
 ## How it works
 
-- The transcript is split into sentences. Each one is generated with the speaker's current voice and streamed in 80 ms frames to the Web Audio API.
+- The transcript is split into sentences. Each one is generated with the speaker's current voice through `generate_speech()`, which yields 80 ms frames that are streamed to the Web Audio API.
 - About 5 seconds of audio is generated ahead of playback, but only about 0.3 seconds is committed to the audio graph. When you change a voice, queued sentences for that speaker are dropped and regenerated, so the change is heard right away.
-- Voices come from [gradium/phonon-voices](https://huggingface.co/gradium/phonon-voices). The model is English-only; the French, German, Spanish and Portuguese voices are offered as accents.
+- The 102 voices from [gradium/phonon-voices](https://huggingface.co/gradium/phonon-voices) are loaded from the model repo with `model.load_voice()`. The model is English-only; the French, German, Spanish and Portuguese voices are offered as accents.
 
 The playback logic lives in `src/tts/PodcastPlayer.ts`.
 
