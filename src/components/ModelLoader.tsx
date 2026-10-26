@@ -12,7 +12,7 @@ interface ModelLoaderProps {
 const formatMb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(0)} MB`;
 
 const FEATURES = [
-  { icon: Radio, label: "Streams in 80 ms frames" },
+  { icon: Radio, label: "Streams a few sentences at a time" },
   { icon: Zap, label: "WebGPU · fp32" },
   { icon: Cpu, label: "100% on device" },
 ];
