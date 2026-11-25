@@ -92,8 +92,8 @@ export const loadPhonon = async (
       }
     },
   });
-  // The first generation compiles the WebGPU shaders. Do it here, behind the
-  // loading screen, instead of during the first turn of an episode.
+  // Run a short inference before playback so ORT can build and cache the
+  // WebGPU compute pipelines used by this prompt.
   try {
     await synthesizeSentence(tts, "Hi.", VOICES[0].id);
   } catch (error) {
