@@ -1,5 +1,10 @@
 import type { Sentence } from "../utils/transcript";
-import { type PhononTTS, SAMPLE_RATE, loadVoice, streamSpeech } from "./phonon";
+import {
+  type PhononTTS,
+  SAMPLE_RATE,
+  loadVoice,
+  synthesizeSentence,
+} from "./phonon";
 
 export type PlayerStatus = "idle" | "playing" | "paused" | "ended";
 
@@ -19,24 +24,20 @@ export interface PlayerState {
   spokenVoices: Record<number, string>;
 }
 
-// One generate_speech call: the rest of a turn, from one sentence to its end.
+// One transcript sentence and its audio, until playback starts.
 interface Segment {
-  sentences: Array<Sentence>;
+  sentence: Sentence;
   voiceId: string;
-  // Audio and text of each processor chunk generated so far.
-  chunks: Array<Float32Array>;
-  texts: Array<string>;
-  scheduled: number;
-  // Audio context time the segment starts playing, once scheduled.
-  start: number | null;
-  done: boolean;
-  // Markers for every sentence after the first have been added.
-  marked: boolean;
+  audio: Float32Array | null;
+  playback: {
+    start: number;
+    previousEnd: number;
+    previousSpeaker: string | null;
+  } | null;
   cancelled: boolean;
 }
 
-// Audio handed to the Web Audio graph can't be taken back, so keep that short
-// and hold the rest in the queue, where a voice change can still replace it.
+// Schedule near playback time, but keep future starts cancellable.
 const SCHEDULE_AHEAD = 0.3;
 const GENERATE_AHEAD = 5;
 const TURN_GAP = 0.3;
@@ -58,12 +59,11 @@ export default class PodcastPlayer {
   private ctx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private queue: Array<Segment> = [];
-  private sources = new Set<AudioBufferSourceNode>();
+  private sources = new Map<AudioBufferSourceNode, number>();
   private markers: Array<{
     time: number;
     sentence: number;
     voiceId: string;
-    spoken: boolean;
   }> = [];
   private nextTime = 0;
   private lastSpeaker: string | null = null;
@@ -115,20 +115,38 @@ export default class PodcastPlayer {
     void this.play();
   };
 
-  // Drop queued audio for this speaker that hasn't started playing, so their
-  // next turn is generated with the new voice.
+  // Rewind to this speaker's next unplayed sentence, even if it was scheduled.
   setVoice = (speaker: string, voiceId: string) => {
-    this.update({ voices: { ...this.state.voices, [speaker]: voiceId } });
-    void loadVoice(this.tts, voiceId).catch(console.error);
+    if (this.state.voices[speaker] === voiceId) return;
+    const voices = { ...this.state.voices, [speaker]: voiceId };
+    void loadVoice(voiceId).catch(console.error);
+    const now = this.ctx?.currentTime ?? 0;
     const index = this.queue.findIndex(
       (segment) =>
-        segment.sentences[0].speaker === speaker && segment.scheduled === 0
+        segment.sentence.speaker === speaker &&
+        (!segment.playback || segment.playback.start > now)
     );
-    if (index === -1) return;
+    if (index === -1) {
+      this.update({ voices });
+      return;
+    }
     const dropped = this.queue.splice(index);
     dropped.forEach((segment) => (segment.cancelled = true));
-    this.cursor = dropped[0].sentences[0].index;
-    this.update({ generatedUntil: this.cursor });
+    const { sentence, playback } = dropped[0];
+    if (playback) {
+      this.stopSourcesFrom(sentence.index);
+      this.markers = this.markers.filter(
+        (marker) => marker.sentence < sentence.index
+      );
+      this.nextTime = playback.previousEnd;
+      this.lastSpeaker = playback.previousSpeaker;
+    }
+    this.cursor = sentence.index;
+    this.update({
+      voices,
+      generatedUntil: Math.min(this.state.generatedUntil, this.cursor),
+      bufferedSeconds: Math.round(this.bufferedSeconds() * 10) / 10,
+    });
     void this.pump();
   };
 
@@ -146,14 +164,19 @@ export default class PodcastPlayer {
     });
   };
 
+  private stopSourcesFrom(sentenceIndex: number) {
+    for (const [source, index] of this.sources) {
+      if (index < sentenceIndex) continue;
+      source.onended = null;
+      source.stop();
+      this.sources.delete(source);
+    }
+  }
+
   private reset(sentenceIndex: number) {
     this.queue.forEach((segment) => (segment.cancelled = true));
     this.queue = [];
-    this.sources.forEach((source) => {
-      source.onended = null;
-      source.stop();
-    });
-    this.sources.clear();
+    this.stopSourcesFrom(0);
     this.markers = [];
     this.nextTime = 0;
     this.lastSpeaker = null;
@@ -161,6 +184,7 @@ export default class PodcastPlayer {
     this.update({
       playingSentence: null,
       generatedUntil: sentenceIndex,
+      generatingSentence: null,
       bufferedSeconds: 0,
     });
   }
@@ -177,18 +201,14 @@ export default class PodcastPlayer {
   private bufferedSeconds() {
     const now = this.ctx?.currentTime ?? 0;
     const unscheduled = this.queue.reduce(
-      (sum, segment) =>
-        sum +
-        segment.chunks
-          .slice(segment.scheduled)
-          .reduce((n, chunk) => n + chunk.length, 0),
+      (sum, segment) => sum + (segment.audio?.length ?? 0),
       0
     );
     return Math.max(0, this.nextTime - now) + unscheduled / SAMPLE_RATE;
   }
 
   private async pump() {
-    if (this.pumping) return;
+    if (this.pumping || this.state.error) return;
     this.pumping = true;
     try {
       while (
@@ -196,40 +216,35 @@ export default class PodcastPlayer {
         this.cursor < this.sentences.length &&
         this.bufferedSeconds() < GENERATE_AHEAD
       ) {
-        const { sentences, text } = this.nextGroup();
-        this.cursor += sentences.length;
+        const sentence = this.sentences[this.cursor++];
         const segment: Segment = {
-          sentences,
-          voiceId: this.state.voices[sentences[0].speaker],
-          chunks: [],
-          texts: [],
-          scheduled: 0,
-          start: null,
-          done: false,
-          marked: false,
+          sentence,
+          voiceId: this.state.voices[sentence.speaker],
+          audio: null,
+          playback: null,
           cancelled: false,
         };
         this.queue.push(segment);
-        this.update({ generatingSentence: sentences[0].index });
+        this.update({ generatingSentence: sentence.index });
 
         const start = performance.now();
-        for await (const chunk of streamSpeech(
-          this.tts,
-          text,
-          segment.voiceId
-        )) {
-          // Leaving the loop stops generation of a turn no longer wanted.
-          if (segment.cancelled) break;
-          segment.chunks.push(chunk.audio);
-          segment.texts.push(chunk.text);
-          this.schedule();
+        let audio: Float32Array;
+        try {
+          audio = await synthesizeSentence(
+            this.tts,
+            sentence.text,
+            segment.voiceId
+          );
+        } catch (error) {
+          if (segment.cancelled) continue;
+          this.queue.pop();
+          this.cursor = sentence.index;
+          throw error;
         }
-        segment.done = true;
         if (segment.cancelled) continue;
 
-        const audioSeconds =
-          segment.chunks.reduce((n, chunk) => n + chunk.length, 0) /
-          SAMPLE_RATE;
+        segment.audio = audio;
+        const audioSeconds = audio.length / SAMPLE_RATE;
         const factor = (performance.now() - start) / 1000 / audioSeconds;
         const previous = this.state.realtimeFactor;
         this.update({
@@ -252,105 +267,45 @@ export default class PodcastPlayer {
     }
   }
 
-  // Every generate_speech call runs the voice through the model first, so a
-  // turn is spoken in one call. A voice change applies from the next turn.
-  private nextGroup() {
-    const { turnIndex } = this.sentences[this.cursor];
-    const sentences = this.sentences
-      .slice(this.cursor)
-      .filter((sentence) => sentence.turnIndex === turnIndex);
-    return {
-      sentences,
-      text: sentences.map((sentence) => sentence.text).join(" "),
-    };
-  }
-
-  // The model reports audio per processor chunk, not per sentence, so once a
-  // segment is complete each later sentence is placed by its share of the
-  // characters within its chunk.
-  private markSentences(segment: Segment) {
-    if (segment.start === null) return;
-    const durations = segment.chunks.map((chunk) => chunk.length / SAMPLE_RATE);
-    const chunkLengths = segment.texts.map((text) => text.length);
-    const chunkTotal = chunkLengths.reduce((a, b) => a + b, 0);
-    // Time at a fraction of the segment's text.
-    const timeAt = (fraction: number) => {
-      let time = segment.start!;
-      let position = fraction * chunkTotal;
-      for (let i = 0; i < durations.length; i++) {
-        if (position <= chunkLengths[i] || i === durations.length - 1) {
-          return time + durations[i] * Math.min(1, position / chunkLengths[i]);
-        }
-        position -= chunkLengths[i];
-        time += durations[i];
-      }
-      return time;
-    };
-    const lengths = segment.sentences.map((sentence) => sentence.text.length);
-    const total = lengths.reduce((a, b) => a + b, 0);
-    let offset = 0;
-    segment.sentences.forEach((sentence, i) => {
-      if (i > 0) {
-        this.markers.push({
-          time: timeAt(offset / total),
-          sentence: sentence.index,
-          voiceId: segment.voiceId,
-          spoken: false,
-        });
-      }
-      offset += lengths[i];
-    });
-    segment.marked = true;
-  }
-
   private schedule() {
     const ctx = this.ctx;
     if (!ctx) return;
     const now = ctx.currentTime;
 
-    while (
-      this.queue[0]?.marked &&
-      this.queue[0].scheduled === this.queue[0].chunks.length
-    ) {
+    while (this.queue[0]?.playback && this.queue[0].playback.start <= now) {
       this.queue.shift();
     }
 
     for (const segment of this.queue) {
-      while (segment.scheduled < segment.chunks.length) {
-        if (this.nextTime - now > SCHEDULE_AHEAD) return;
-        if (segment.scheduled === 0) {
-          const gap =
-            this.lastSpeaker &&
-            this.lastSpeaker !== segment.sentences[0].speaker
-              ? TURN_GAP
-              : 0;
-          this.nextTime = Math.max(this.nextTime, now + 0.05) + gap;
-          segment.start = this.nextTime;
-          this.markers.push({
-            time: this.nextTime,
-            sentence: segment.sentences[0].index,
-            voiceId: segment.voiceId,
-            spoken: false,
-          });
-          this.lastSpeaker = segment.sentences[0].speaker;
-        } else if (this.nextTime < now) {
-          // Generation fell behind playback; resume as soon as possible.
-          this.nextTime = now + 0.02;
-        }
+      if (segment.playback) continue;
+      if (!segment.audio || this.nextTime - now > SCHEDULE_AHEAD) return;
 
-        const chunk = segment.chunks[segment.scheduled++];
-        const buffer = ctx.createBuffer(1, chunk.length, SAMPLE_RATE);
-        buffer.copyToChannel(chunk as Float32Array<ArrayBuffer>, 0);
-        const source = ctx.createBufferSource();
-        source.buffer = buffer;
-        source.connect(this.analyser ?? ctx.destination);
-        source.start(this.nextTime);
-        source.onended = () => this.sources.delete(source);
-        this.sources.add(source);
-        this.nextTime += buffer.duration;
-      }
-      if (!segment.done) return;
-      if (!segment.marked) this.markSentences(segment);
+      const { speaker, index } = segment.sentence;
+      const gap =
+        this.lastSpeaker && this.lastSpeaker !== speaker ? TURN_GAP : 0;
+      const start = Math.max(this.nextTime, now + 0.05) + gap;
+      const buffer = ctx.createBuffer(1, segment.audio.length, SAMPLE_RATE);
+      buffer.copyToChannel(segment.audio as Float32Array<ArrayBuffer>, 0);
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(this.analyser ?? ctx.destination);
+      source.start(start);
+      source.onended = () => this.sources.delete(source);
+      this.sources.set(source, index);
+
+      segment.playback = {
+        start,
+        previousEnd: this.nextTime,
+        previousSpeaker: this.lastSpeaker,
+      };
+      segment.audio = null;
+      this.markers.push({
+        time: start,
+        sentence: index,
+        voiceId: segment.voiceId,
+      });
+      this.lastSpeaker = speaker;
+      this.nextTime = start + buffer.duration;
     }
   }
 
@@ -362,9 +317,7 @@ export default class PodcastPlayer {
     const now = this.ctx.currentTime;
     const started = this.markers.filter((marker) => marker.time <= now);
     const current = started[started.length - 1];
-    if (current) this.markers = this.markers.slice(started.length - 1);
-    const newlySpoken = started.filter((marker) => !marker.spoken);
-    newlySpoken.forEach((marker) => (marker.spoken = true));
+    if (current) this.markers = this.markers.slice(started.length);
 
     const finished =
       this.cursor >= this.sentences.length &&
@@ -375,12 +328,12 @@ export default class PodcastPlayer {
     this.update({
       playingSentence: current?.sentence ?? this.state.playingSentence,
       bufferedSeconds: Math.round(this.bufferedSeconds() * 10) / 10,
-      ...(newlySpoken.length > 0
+      ...(started.length > 0
         ? {
             spokenVoices: {
               ...this.state.spokenVoices,
               ...Object.fromEntries(
-                newlySpoken.map((marker) => [marker.sentence, marker.voiceId])
+                started.map((marker) => [marker.sentence, marker.voiceId])
               ),
             },
           }

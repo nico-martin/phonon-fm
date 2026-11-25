@@ -25,17 +25,18 @@ export default function TranscriptView({
   className = "",
 }: TranscriptViewProps) {
   const container = useRef<HTMLDivElement>(null);
+  const activeSentence = state.playingSentence;
   const activeTurn =
-    state.playingSentence === null
+    activeSentence === null
       ? null
-      : transcript.sentences[state.playingSentence].turnIndex;
+      : transcript.sentences[activeSentence].turnIndex;
 
   useEffect(() => {
-    if (activeTurn === null) return;
+    if (activeSentence === null) return;
     container.current
-      ?.querySelector(`[data-turn="${activeTurn}"]`)
+      ?.querySelector(`[data-sentence="${activeSentence}"]`)
       ?.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [activeTurn]);
+  }, [activeSentence]);
 
   return (
     <div ref={container} className={className}>
@@ -51,10 +52,11 @@ export default function TranscriptView({
           state.generatedUntil > first
             ? Math.min(state.generatedUntil, last + 1)
             : 0;
-        // Show the voice the turn was actually spoken in, once it has played.
-        const voiceId = state.spokenVoices[first] ?? state.voices[turn.speaker];
+        // The voice can change mid-turn; show the one playing now.
+        const voiceId =
+          state.spokenVoices[playing ?? first] ?? state.voices[turn.speaker];
         return (
-          <div key={turn.index} data-turn={turn.index}>
+          <div key={turn.index}>
             <TurnView
               turn={turn}
               style={speakerStyle(transcript.speakers, turn.speaker)}

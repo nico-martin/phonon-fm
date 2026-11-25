@@ -69,6 +69,7 @@ function TurnView({
             return (
               <span
                 key={sentence.index}
+                data-sentence={sentence.index}
                 onClick={() => onSeek(sentence.index)}
                 title="Play from here"
                 className={cn(

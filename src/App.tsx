@@ -75,7 +75,11 @@ export default function App() {
         </main>
       ) : (
         <main className="flex flex-1 items-center py-16">
-          <ModelLoader className="w-full" onLoaded={setTts} />
+          <ModelLoader
+            className="w-full"
+            // The pipeline is callable; store it rather than running it as a state updater.
+            onLoaded={(pipeline) => setTts(() => pipeline)}
+          />
         </main>
       )}
 

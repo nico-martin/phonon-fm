@@ -1,106 +1,104 @@
 import {
   type DeviceType,
-  GradiumPhononTTSForConditionalGeneration,
-  PocketTTSProcessor,
-  type ProgressInfo,
-  Tensor,
+  ModelRegistry,
+  type TextToAudioPipeline,
+  pipeline,
 } from "@huggingface/transformers";
 
 import { VOICES } from "../data/voices";
 
 const MODEL_ID = "onnx-community/phonon-31m-en-ONNX";
+const TASK = "text-to-speech";
+const DEFAULT_DEVICE = "webgpu";
 
 export const SAMPLE_RATE = 24000;
+export const DTYPE = "q4f16";
 
-export interface PhononTTS {
-  model: GradiumPhononTTSForConditionalGeneration;
-  processor: PocketTTSProcessor;
-}
+export type PhononTTS = TextToAudioPipeline;
 
 export interface LoadProgress {
   loaded: number;
   total: number;
 }
 
-// Voices are flat float32 files in [1, voice_dim, frames] order. Each one is
-// loaded once from the model repo and kept as a tensor for the lifetime of the
-// page; generate_speech never disposes it.
-const voices = new Map<string, Promise<Tensor>>();
+export const getPhononDownloadSize = async (): Promise<number | null> => {
+  const files = await ModelRegistry.get_pipeline_files(TASK, MODEL_ID, {
+    dtype: DTYPE,
+    device: DEFAULT_DEVICE,
+  });
+  const metadata = await Promise.all(
+    files.map((file) => ModelRegistry.get_file_metadata(MODEL_ID, file))
+  );
+  let total = 0;
+  for (const { exists, size } of metadata) {
+    if (!exists || size === undefined || !Number.isFinite(size)) return null;
+    total += size;
+  }
+  return total || null;
+};
 
-const fetchVoice = async (
-  { model }: PhononTTS,
-  voiceId: string
-): Promise<Tensor> => {
+// Cache raw embeddings; the pipeline handles their layout and prompt preparation.
+const voices = new Map<string, Promise<Float32Array>>();
+
+const fetchVoice = async (voiceId: string): Promise<Float32Array> => {
   const response = await fetch(
     `https://huggingface.co/${MODEL_ID}/resolve/main/voices/${voiceId}.bin`
   );
-  if (!response.ok) throw new Error(`Could not load voice ${voiceId}.`);
-  const data = new Float32Array(await response.arrayBuffer());
-  const { voice_dim } = (
-    model.config as unknown as { phonon: { voice_dim: number } }
-  ).phonon;
-  return new Tensor("float32", data, [1, voice_dim, data.length / voice_dim]);
+  if (!response.ok)
+    throw new Error(`Could not load voice ${voiceId} (${response.status}).`);
+  const buffer = await response.arrayBuffer();
+  if (
+    !buffer.byteLength ||
+    buffer.byteLength % Float32Array.BYTES_PER_ELEMENT !== 0
+  ) {
+    throw new Error(`Invalid voice data for ${voiceId}.`);
+  }
+  return new Float32Array(buffer);
 };
 
-export const loadVoice = (tts: PhononTTS, voiceId: string): Promise<Tensor> => {
+export const loadVoice = (voiceId: string): Promise<Float32Array> => {
   const cached = voices.get(voiceId);
   if (cached) return cached;
-  const voice = fetchVoice(tts, voiceId);
+  const voice = fetchVoice(voiceId);
   voice.catch(() => voices.delete(voiceId));
   voices.set(voiceId, voice);
   return voice;
 };
 
-export interface SpeechChunk {
-  // 24 kHz mono PCM of one processor chunk: one or more sentences, up to 50
-  // tokens.
-  audio: Float32Array;
-  text: string;
-}
-
-// Yields the audio of each text chunk as soon as it is ready. Each call runs
-// the voice through the flow model first, so callers should pass as much text
-// per call as they can. Leaving the loop early stops generation and frees the
-// model state.
-export async function* streamSpeech(
+export const synthesizeSentence = async (
   tts: PhononTTS,
   text: string,
   voiceId: string
-): AsyncGenerator<SpeechChunk> {
-  // generate_speech yields one waveform per processor chunk, in this order.
-  const texts = tts.processor.split_text(text);
-  let index = 0;
-  for await (const audio of tts.model.generate_speech({
-    chunks: await tts.processor(text),
-    speaker_embeddings: await loadVoice(tts, voiceId),
-  })) {
-    yield { audio, text: texts[index++] };
+): Promise<Float32Array> => {
+  const { audio } = await tts(text, {
+    speaker_embeddings: await loadVoice(voiceId),
+  });
+  if (!(audio instanceof Float32Array) || !audio.length) {
+    throw new Error("Phonon returned no mono audio.");
   }
-}
+  return audio;
+};
 
 export const loadPhonon = async (
   onProgress?: (progress: LoadProgress) => void,
-  device: DeviceType = "webgpu"
+  device: DeviceType = DEFAULT_DEVICE
 ): Promise<PhononTTS> => {
-  const [model, processor] = await Promise.all([
-    GradiumPhononTTSForConditionalGeneration.from_pretrained(MODEL_ID, {
-      dtype: "fp32",
-      device,
-      progress_callback: (info: ProgressInfo) => {
-        if (info.status === "progress_total") {
-          onProgress?.({ loaded: info.loaded, total: info.total });
-        }
-      },
-    }),
-    PocketTTSProcessor.from_pretrained(MODEL_ID),
-  ]);
-  const tts = {
-    model: model as GradiumPhononTTSForConditionalGeneration,
-    processor: processor as PocketTTSProcessor,
-  };
+  const tts = await pipeline(TASK, MODEL_ID, {
+    dtype: DTYPE,
+    device,
+    progress_callback: (info) => {
+      if (info.status === "progress_total") {
+        onProgress?.({ loaded: info.loaded, total: info.total });
+      }
+    },
+  });
   // The first generation compiles the WebGPU shaders. Do it here, behind the
   // loading screen, instead of during the first turn of an episode.
-  const warmUp = streamSpeech(tts, "Hi.", VOICES[0].id);
-  while (!(await warmUp.next()).done);
+  try {
+    await synthesizeSentence(tts, "Hi.", VOICES[0].id);
+  } catch (error) {
+    await tts.dispose();
+    throw error;
+  }
   return tts;
 };

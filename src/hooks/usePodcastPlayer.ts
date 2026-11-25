@@ -21,10 +21,10 @@ export default function usePodcastPlayer(
 
   useEffect(() => {
     Object.values(player.getState().voices).forEach(
-      (voiceId) => void loadVoice(tts, voiceId).catch(console.error)
+      (voiceId) => void loadVoice(voiceId).catch(console.error)
     );
     return () => player.stop();
-  }, [player, tts]);
+  }, [player]);
 
   return { player, state };
 }

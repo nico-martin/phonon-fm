@@ -1,8 +1,14 @@
 import { Cpu, Download, Radio, Zap } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import { Button, ProgressBar } from "../theme";
-import { type LoadProgress, type PhononTTS, loadPhonon } from "../tts/phonon";
+import {
+  DTYPE,
+  type LoadProgress,
+  type PhononTTS,
+  getPhononDownloadSize,
+  loadPhonon,
+} from "../tts/phonon";
 
 interface ModelLoaderProps {
   onLoaded: (tts: PhononTTS) => void;
@@ -13,7 +19,7 @@ const formatMb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(0)} MB`;
 
 const FEATURES = [
   { icon: Radio, label: "Streams a few sentences at a time" },
-  { icon: Zap, label: "WebGPU · fp32" },
+  { icon: Zap, label: "WebGPU · " + DTYPE },
   { icon: Cpu, label: "100% on device" },
 ];
 
@@ -30,7 +36,24 @@ export default function ModelLoader({
   const [progress, setProgress] = useState<LoadProgress | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [downloadSize, setDownloadSize] = useState<number | null>(null);
   const hasWebGPU = "gpu" in navigator;
+
+  useEffect(() => {
+    if (!hasWebGPU) return;
+    let active = true;
+    void getPhononDownloadSize().then(
+      (size) => {
+        if (active) setDownloadSize(size);
+      },
+      () => {
+        // A size lookup failure shouldn't block loading the model.
+      }
+    );
+    return () => {
+      active = false;
+    };
+  }, [hasWebGPU]);
 
   const load = async () => {
     setLoading(true);
@@ -111,7 +134,9 @@ export default function ModelLoader({
               disabled={!hasWebGPU}
             >
               <Download className="size-4" />
-              Load model · 165 MB
+              {downloadSize === null
+                ? "Load model"
+                : `Load model · ${formatMb(downloadSize)}`}
             </Button>
           )}
 
